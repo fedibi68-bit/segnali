@@ -139,15 +139,36 @@ if res:
             st.success(f"⚡ Titoli con almeno un segnale oggi: {len(con_segnale)}"
                        + (f" — di cui in confluenza (2+): {n_conf}" if n_conf else ""))
         spunta = lambda b: "✅" if b else "—"
+
+        def n_attivi(r):
+            return int(bool(r["momentum"])) + int(bool(r["pullback"])) + int(bool(r["compressione"]))
+
+        # confluenze (2+) in cima, poi per numero di algoritmi attivi
+        da_mostrare = sorted(da_mostrare, key=lambda r: -n_attivi(r))
+
         tab = pd.DataFrame([{
+            "": "🔗" if n_attivi(r) >= 2 else "",
             "Titolo": r["ticker"], "Prezzo": r["prezzo"],
             "Base": NOMI.get(base_algo.get(r["ticker"], ""), "?"),
             "Momentum": spunta(r["momentum"]), "Pullback": spunta(r["pullback"]),
             "Compressione": spunta(r["compressione"]), "Stop sugg.": r["stop_suggerito"],
         } for r in da_mostrare])
-        st.dataframe(tab, use_container_width=True, hide_index=True)
-        st.caption("'Base' = l'algoritmo naturale del titolo (dalla volatilita'). La Compressione si accende "
-                   "solo nei giorni di compressione. ✅ = segnale attivo oggi.")
+
+        # evidenzia di verde tenue le righe in confluenza (2+ algoritmi)
+        def evidenzia(row):
+            conf = row[""] == "🔗"
+            return ["background-color: rgba(34,197,94,0.18); font-weight:600" if conf else "" for _ in row]
+
+        try:
+            styled = tab.style.apply(evidenzia, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+        except Exception:
+            # se lo styling non è disponibile, mostra comunque la tabella semplice
+            st.dataframe(tab, use_container_width=True, hide_index=True)
+
+        st.caption("🔗 = confluenza (2+ algoritmi accesi): righe verdi in cima. "
+                   "'Base' = l'algoritmo naturale del titolo (dalla volatilita'). "
+                   "La Compressione si accende solo nei giorni di compressione. ✅ = segnale attivo oggi.")
     if res["falliti"]:
         st.caption("Non scaricati: " + ", ".join(res["falliti"]) + ".")
 else:
