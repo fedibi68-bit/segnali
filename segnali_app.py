@@ -143,15 +143,28 @@ if res:
         def n_attivi(r):
             return int(bool(r["momentum"])) + int(bool(r["pullback"])) + int(bool(r["compressione"]))
 
+        def prezzo_fmt(p):
+            """Decimali intelligenti: più cifre sui titoli economici, meno su quelli cari."""
+            try:
+                p = float(p)
+            except (TypeError, ValueError):
+                return p
+            if p >= 100:
+                return f"{p:.2f}"
+            if p >= 1:
+                return f"{p:.3f}".rstrip("0").rstrip(".")
+            return f"{p:.4f}".rstrip("0").rstrip(".")
+
         # confluenze (2+) in cima, poi per numero di algoritmi attivi
         da_mostrare = sorted(da_mostrare, key=lambda r: -n_attivi(r))
 
         tab = pd.DataFrame([{
             "": "🔗" if n_attivi(r) >= 2 else "",
-            "Titolo": r["ticker"], "Prezzo": r["prezzo"],
+            "Titolo": r["ticker"],
             "Base": NOMI.get(base_algo.get(r["ticker"], ""), "?"),
             "Momentum": spunta(r["momentum"]), "Pullback": spunta(r["pullback"]),
-            "Compressione": spunta(r["compressione"]), "Stop sugg.": r["stop_suggerito"],
+            "Compressione": spunta(r["compressione"]),
+            "Prezzo": prezzo_fmt(r["prezzo"]), "Stop sugg.": prezzo_fmt(r["stop_suggerito"]),
         } for r in da_mostrare])
 
         # evidenzia di verde tenue le righe in confluenza (2+ algoritmi)
