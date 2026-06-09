@@ -984,7 +984,9 @@ def prezzo_intraday(ticker):
             df.columns = df.columns.get_level_values(0)
         df.columns = [str(c).lower() for c in df.columns]
         riga = df.dropna(subset=["close"]).iloc[-1]
-        return {"prezzo": round(float(riga["close"]), 2),
+        # precisione piena: l'arrotondamento si fa solo in visualizzazione,
+        # altrimenti su titoli sotto l'euro il calcolo del gap si sporca
+        return {"prezzo": float(riga["close"]),
                 "ora_dato": str(pd.Timestamp(df.index[-1]))}
     except Exception:
         return None
@@ -1038,52 +1040,228 @@ def segnali_diurni(tickers, carattere_map, periodo="2y"):
             "ora_controllo": str(pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"))}
 
 
+
 # ==========================================================
-# SEGNALI DIURNI: ricalcola col prezzo di OGGI a mercato aperto
-#   e mostra il GAP rispetto alla chiusura precedente.
-#   (dati Yahoo: ritardo ~15-20 min, irrilevante per lo swing)
+# CONTROLLO DEL MATTINO (anti-gap)
+#   Filosofia: il SEGNALE resta quello calcolato sulla candela
+#   COMPLETA di ieri (affidabile). Al mattino non si ricalcola
+#   nulla sulla candela viva: si verifica solo se il gap di
+#   apertura ha invalidato il segnale, con un verdetto meccanico.
+#
+#   Verdetti (misurati in unita' di ATR di ieri):
+#     OK             gap contenuto: il piano di ieri sera vale ancora
+#     NON INSEGUIRE  gap su oltre soglia: si entrerebbe a un prezzo
+#                    che il backtest non ha mai pagato
+#     ANNULLATO      gap giu' oltre soglia: il presupposto del
+#                    segnale e' saltato (spesso c'e' una notizia)
+#
+#   I verdetti sono etichette meccaniche delle condizioni,
+#   non consigli operativi: la decisione resta dell'utente.
 # ==========================================================
-def segnali_diurni(tickers, carattere_map, periodo="3mo"):
+def controllo_mattino(tickers, periodo="2y",
+                      soglia_ok_atr=0.5, soglia_annulla_atr=0.5):
     """
-    Scarica i dati piu' recenti (inclusa la candela di oggi in corso) e per ogni titolo:
-    - prezzo attuale (ultima candela disponibile)
-    - chiusura precedente e gap %
-    - quali algoritmi segnalano ORA
+    Per ogni titolo:
+      1) segnali calcolati sull'ultima candela GIORNALIERA COMPLETA
+         (se i dati includono la candela di oggi in corso, viene scartata)
+      2) prezzo di adesso (intraday ~15 min di ritardo) e gap % vs ieri
+      3) verdetto OK / NON INSEGUIRE / ANNULLATO in base al gap in ATR
+    Restituisce solo numeri grezzi: l'arrotondamento e' della UI.
     """
-    import yfinance as yf
+    oggi = pd.Timestamp.today().normalize()
+    dati = carica_watchlist(tickers, periodo)
+    falliti = [t for t in tickers if t and t not in dati]
     righe = []
-    falliti = []
-    ora = pd.Timestamp.now().strftime("%H:%M")
-    for t in tickers:
+
+    for t, df in dati.items():
         try:
-            df = yf.download(t, period=periodo, interval="1d", auto_adjust=True, progress=False)
-            if df is None or df.empty:
-                falliti.append(t); continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [str(c).lower() for c in df.columns]
-            df = df[["open", "high", "low", "close", "volume"]].dropna()
-            if len(df) < 60:
-                falliti.append(t); continue
-            prezzo_ora = float(df["close"].iloc[-1])
-            chiusura_prec = float(df["close"].iloc[-2])
-            gap = (prezzo_ora / chiusura_prec - 1) * 100
-            s = {}
+            # 1) tieni SOLO candele complete: via quella di oggi se presente
+            comp = df[df.index.normalize() < oggi]
+            if len(comp) < 250:
+                falliti.append(t)
+                continue
+
+            seg = {}
             for entry in ("momentum", "pullback", "compressione"):
                 try:
-                    s[entry] = bool(_seg_for(entry, df).iloc[-1])
+                    seg[entry] = bool(_seg_for(entry, comp).iloc[-1])
                 except Exception:
-                    s[entry] = False
-            n_acc = sum(s.values())
-            righe.append({"ticker": t, "prezzo_ora": round(prezzo_ora, 2),
-                          "chiusura_prec": round(chiusura_prec, 2), "gap_pct": round(gap, 2),
-                          "data": str(pd.Timestamp(df.index[-1]).date()),
-                          "data_prec": str(pd.Timestamp(df.index[-2]).date()),
-                          "carattere": carattere_map.get(t, "calmo"),
-                          "momentum": s["momentum"], "pullback": s["pullback"],
-                          "compressione": s["compressione"],
-                          "n_algoritmi": n_acc, "confluenza": n_acc >= 2, "qualcuno": n_acc >= 1})
+                    seg[entry] = False
+            n_attivi = sum(seg.values())
+
+            chiusura_ieri = float(comp["close"].iloc[-1])
+            atr_ieri = float(atr(comp, 14).iloc[-1])
+            atr_pct = atr_ieri / chiusura_ieri * 100 if chiusura_ieri else 0.0
+
+            # 2) prezzo di adesso (se non disponibile: mercato chiuso o
+            #    dato mancante -> gap non valutabile, si segnala)
+            intr = prezzo_intraday(t)
+            if intr and intr["prezzo"]:
+                prezzo_ora = float(intr["prezzo"])
+                ora_dato = intr["ora_dato"]
+                gap_pct = (prezzo_ora / chiusura_ieri - 1) * 100
+                gap_atr = gap_pct / atr_pct if atr_pct > 0 else 0.0
+            else:
+                prezzo_ora, ora_dato = chiusura_ieri, "n/d"
+                gap_pct, gap_atr = 0.0, 0.0
+
+            # 3) verdetto meccanico (solo se ieri sera c'era un segnale)
+            if n_attivi == 0:
+                verdetto = "—"
+            elif intr is None:
+                verdetto = "GAP N/D"
+            elif gap_atr > soglia_ok_atr:
+                verdetto = "NON INSEGUIRE"
+            elif gap_atr < -soglia_annulla_atr:
+                verdetto = "ANNULLATO"
+            else:
+                verdetto = "OK"
+
+            righe.append({
+                "ticker": t,
+                "momentum": seg["momentum"], "pullback": seg["pullback"],
+                "compressione": seg["compressione"],
+                "n_attivi": n_attivi, "confluenza": n_attivi >= 2,
+                "qualcuno": n_attivi >= 1,
+                "data_segnale": str(pd.Timestamp(comp.index[-1]).date()),
+                "chiusura_ieri": chiusura_ieri,
+                "prezzo_ora": prezzo_ora, "ora_dato": ora_dato,
+                "gap_pct": gap_pct, "gap_atr": gap_atr,
+                "atr_pct": atr_pct,
+                # stop indicativo dall'ATR di IERI (candela completa),
+                # ancorato al prezzo di adesso
+                "stop_indicativo": prezzo_ora - 1.5 * atr_ieri,
+                "verdetto": verdetto,
+            })
         except Exception:
             falliti.append(t)
-    return {"righe": righe, "falliti": falliti, "ora": ora,
-            "quando": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")}
+
+    return {"righe": righe, "falliti": falliti,
+            "ora_controllo": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "soglia_ok_atr": soglia_ok_atr, "soglia_annulla_atr": soglia_annulla_atr}
+
+
+# ==========================================================
+# SEMAFORO D'INGRESSO (qualsiasi ora di mercato aperto)
+#   Evoluzione del controllo del mattino. Combina:
+#     1) segnali di IERI SERA su candela completa (+ confluenze)
+#     2) TRIGGER: il massimo di ieri deve essere superato OGGI
+#        (conferma di prezzo: e' il mercato a dire che parte)
+#     3) ESTENSIONE: quanto e' gia' corso oltre il trigger
+#        (per non inseguire un ingresso che il backtest non ha mai pagato)
+#
+#   Stati (etichette meccaniche, la decisione resta dell'utente):
+#     VIA LIBERA      trigger superato, prezzo ancora vicino: il piano vale
+#     ATTESA TRIGGER  segnale valido ma il massimo di ieri non e' stato rotto
+#     NON INSEGUIRE   trigger superato ma prezzo gia' esteso oltre soglia
+#     RIENTRATO       trigger toccato oggi ma prezzo ricaduto sotto:
+#                     rottura fallita, segnale di debolezza
+#     ANNULLATO       prezzo sotto la chiusura di ieri oltre soglia:
+#                     presupposto saltato
+#     DATI N/D        intraday non disponibile (mercato chiuso?)
+# ==========================================================
+def quadro_intraday(ticker):
+    """Prezzo attuale E massimo di OGGI (5m, ~15 min di ritardo).
+    Il massimo di oggi serve per sapere se il trigger e' stato toccato
+    anche quando il prezzo, adesso, e' rientrato sotto."""
+    import yfinance as yf
+    try:
+        df = yf.download(ticker, period="2d", interval="5m",
+                         auto_adjust=True, progress=False)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.dropna(subset=["close"])
+        oggi = df[df.index.normalize() == df.index[-1].normalize()]
+        if oggi.empty:
+            return None
+        return {"prezzo": float(oggi["close"].iloc[-1]),
+                "massimo_oggi": float(oggi["high"].max()),
+                "ora_dato": str(pd.Timestamp(df.index[-1]))}
+    except Exception:
+        return None
+
+
+def semaforo_ingresso(tickers, periodo="2y",
+                      soglia_estensione_atr=1.0, soglia_annulla_atr=0.5):
+    """
+    Per ogni titolo con segnale IERI SERA (candela completa):
+      trigger = massimo di ieri; si confronta con massimo e prezzo di OGGI.
+    Restituisce numeri grezzi; l'arrotondamento e' della UI.
+    """
+    oggi = pd.Timestamp.today().normalize()
+    dati = carica_watchlist(tickers, periodo)
+    falliti = [t for t in tickers if t and t not in dati]
+    righe = []
+
+    for t, df in dati.items():
+        try:
+            comp = df[df.index.normalize() < oggi]   # solo candele complete
+            if len(comp) < 250:
+                falliti.append(t)
+                continue
+
+            seg = {}
+            for entry in ("momentum", "pullback", "compressione"):
+                try:
+                    seg[entry] = bool(_seg_for(entry, comp).iloc[-1])
+                except Exception:
+                    seg[entry] = False
+            n_attivi = sum(seg.values())
+
+            chiusura_ieri = float(comp["close"].iloc[-1])
+            trigger = float(comp["high"].iloc[-1])      # massimo di ieri
+            atr_ieri = float(atr(comp, 14).iloc[-1])
+
+            q = quadro_intraday(t) if n_attivi else None
+            prezzo_ora = q["prezzo"] if q else chiusura_ieri
+            massimo_oggi = q["massimo_oggi"] if q else None
+            ora_dato = q["ora_dato"] if q else "n/d"
+
+            # distanze utili (in ATR di ieri)
+            dist_trigger_atr = ((prezzo_ora - trigger) / atr_ieri) if atr_ieri else 0.0
+            dist_chiusura_atr = ((prezzo_ora - chiusura_ieri) / atr_ieri) if atr_ieri else 0.0
+
+            # --- stato, in ordine di priorita' ---
+            if n_attivi == 0:
+                stato = "—"
+            elif q is None:
+                stato = "DATI N/D"
+            elif dist_chiusura_atr < -soglia_annulla_atr:
+                stato = "ANNULLATO"
+            elif massimo_oggi <= trigger:
+                stato = "ATTESA TRIGGER"
+            elif prezzo_ora > trigger + soglia_estensione_atr * atr_ieri:
+                stato = "NON INSEGUIRE"
+            elif prezzo_ora < trigger:
+                stato = "RIENTRATO"
+            else:
+                stato = "VIA LIBERA"
+
+            righe.append({
+                "ticker": t,
+                "momentum": seg["momentum"], "pullback": seg["pullback"],
+                "compressione": seg["compressione"],
+                "n_attivi": n_attivi, "confluenza": n_attivi >= 2,
+                "qualcuno": n_attivi >= 1,
+                "data_segnale": str(pd.Timestamp(comp.index[-1]).date()),
+                "chiusura_ieri": chiusura_ieri,
+                "trigger": trigger,
+                "prezzo_ora": prezzo_ora,
+                "massimo_oggi": massimo_oggi,
+                "dist_trigger_atr": dist_trigger_atr,
+                "dist_chiusura_atr": dist_chiusura_atr,
+                "atr_ieri": atr_ieri,
+                "stop_indicativo": (max(prezzo_ora, trigger) - 1.5 * atr_ieri),
+                "ora_dato": ora_dato,
+                "stato": stato,
+            })
+        except Exception:
+            falliti.append(t)
+
+    return {"righe": righe, "falliti": falliti,
+            "ora_controllo": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+            "soglia_estensione_atr": soglia_estensione_atr,
+            "soglia_annulla_atr": soglia_annulla_atr}

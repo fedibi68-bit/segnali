@@ -188,5 +188,110 @@ else:
     st.info("Premi «Cerca segnali di OGGI» per scansionare la tua watchlist.")
 
 st.divider()
+
+# ===== SEMAFORO D'INGRESSO (qualsiasi ora) =====
+st.subheader("🚦 Semaforo d'ingresso — valido a qualsiasi ora")
+st.caption("I segnali sono quelli di IERI SERA (candela completa). Il semaforo combina: "
+           "**trigger** (il prezzo deve superare il massimo di ieri — conferma di prezzo) "
+           "ed **estensione** (quanto è già corso, per non inseguire). "
+           "Funziona alle 9:10 come alle 16:30: misura sempre la distanza dal piano di ieri.")
+
+sf1, sf2 = st.columns([1, 2])
+scan_sf = sf1.button("🚦 Aggiorna il semaforo", type="primary",
+                     use_container_width=True, key="sf_btn")
+with sf2.expander("⚙️ Soglie (in ATR di ieri)"):
+    s_est = st.slider("Oltre il trigger di più di così = NON INSEGUIRE",
+                      0.3, 2.0, 1.0, 0.1, key="sf_est")
+    s_ann = st.slider("Sotto la chiusura di ieri di più di così = ANNULLATO",
+                      0.2, 1.5, 0.5, 0.1, key="sf_ann")
+solo_conf = sf2.checkbox("Mostra solo le confluenze (2+ algoritmi)", value=False, key="sf_conf")
+
+if scan_sf:
+    with st.spinner("Segnali di ieri sera + trigger + estensione…"):
+        try:
+            st.session_state["sf_res"] = eng.semaforo_ingresso(
+                [t["ticker"] for t in titoli],
+                soglia_estensione_atr=s_est, soglia_annulla_atr=s_ann)
+        except Exception as ex:
+            st.error(f"Problema: {ex}")
+
+sf_res = st.session_state.get("sf_res")
+if sf_res:
+    st.caption(f"Aggiornato alle {sf_res['ora_controllo']} — prezzi Yahoo con ~15 min di ritardo.")
+    righe_sf = [r for r in sf_res["righe"] if r["qualcuno"]]
+    if solo_conf:
+        righe_sf = [r for r in righe_sf if r["confluenza"]]
+
+    if not righe_sf:
+        st.info("🟢 Nessun segnale di ieri sera da sorvegliare"
+                + (" (con confluenza 2+)." if solo_conf else ". Si aspetta."))
+    else:
+        ordine = {"VIA LIBERA": 0, "ATTESA TRIGGER": 1, "RIENTRATO": 2,
+                  "NON INSEGUIRE": 3, "ANNULLATO": 4, "DATI N/D": 5}
+        righe_sf = sorted(righe_sf, key=lambda r: (ordine.get(r["stato"], 9),
+                                                   -r["n_attivi"]))
+        n_via = sum(1 for r in righe_sf if r["stato"] == "VIA LIBERA")
+        n_att = sum(1 for r in righe_sf if r["stato"] == "ATTESA TRIGGER")
+        st.success(f"Sorvegliati: {len(righe_sf)} — 🟩 via libera: {n_via} — ⏳ in attesa di trigger: {n_att}")
+
+        def fmt_p(p):
+            try:
+                p = float(p)
+            except (TypeError, ValueError):
+                return "—" if p is None else p
+            if p >= 100: return f"{p:.2f}"
+            if p >= 1:   return f"{p:.3f}".rstrip("0").rstrip(".")
+            return f"{p:.4f}".rstrip("0").rstrip(".")
+
+        spunta_s = lambda b: "✅" if b else "—"
+        tab_s = pd.DataFrame([{
+            "": "🔗" if r["confluenza"] else "",
+            "Titolo": r["ticker"],
+            "M": spunta_s(r["momentum"]), "P": spunta_s(r["pullback"]),
+            "C": spunta_s(r["compressione"]),
+            "Trigger (max ieri)": fmt_p(r["trigger"]),
+            "Prezzo ora": fmt_p(r["prezzo_ora"]),
+            "Max oggi": fmt_p(r["massimo_oggi"]) if r["massimo_oggi"] is not None else "—",
+            "Dist. trigger (ATR)": f"{r['dist_trigger_atr']:+.2f}",
+            "Semaforo": r["stato"],
+            "Stop indic.": fmt_p(r["stop_indicativo"]),
+        } for r in righe_sf])
+
+        def colora_semaforo(row):
+            v = row["Semaforo"]
+            if v == "VIA LIBERA":
+                c = "background-color: rgba(34,197,94,0.20); font-weight:600"
+            elif v == "ATTESA TRIGGER":
+                c = "background-color: rgba(59,130,246,0.12)"
+            elif v == "NON INSEGUIRE":
+                c = "background-color: rgba(250,204,21,0.20)"
+            elif v == "RIENTRATO":
+                c = "background-color: rgba(249,115,22,0.18)"
+            elif v == "ANNULLATO":
+                c = "background-color: rgba(239,68,68,0.18)"
+            else:
+                c = ""
+            return [c for _ in row]
+
+        try:
+            st.dataframe(tab_s.style.apply(colora_semaforo, axis=1),
+                         use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(tab_s, use_container_width=True, hide_index=True)
+
+        st.caption("🟩 VIA LIBERA = trigger superato e prezzo ancora vicino • "
+                   "🟦 ATTESA TRIGGER = segnale valido, il massimo di ieri non è ancora stato rotto • "
+                   "🟧 RIENTRATO = trigger toccato oggi ma prezzo ricaduto sotto (rottura fallita) • "
+                   "🟨 NON INSEGUIRE = già corso oltre soglia • 🟥 ANNULLATO = sceso oltre soglia "
+                   "sotto la chiusura di ieri • DATI N/D = intraday non disponibile (mercato chiuso?). "
+                   "Stati meccanici, non consigli: la decisione resta tua. "
+                   "Un aggiornamento, un verdetto, una decisione — non riaggiornare finché non dice quello che speri.")
+    if sf_res["falliti"]:
+        st.caption("Non controllati: " + ", ".join(sf_res["falliti"]) + ".")
+else:
+    st.info("Premi «Aggiorna il semaforo» a mercato aperto, all'ora che riesci: "
+            "ti dice per ogni segnale di ieri sera se è VIA LIBERA, in ATTESA, da NON INSEGUIRE o ANNULLATO.")
+
+st.divider()
 st.caption("Watchlist propria in titoli_segnali.json (separata da Sentinella). "
            "Lo strumento segnala, la decisione resta tua.")
